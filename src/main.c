@@ -13,6 +13,7 @@
 #include "pm/loop.h"
 #include "pm/writer.h"
 
+#define BUFFER_SIZE 8192
 #define MAX_EVENTS 64
 #define MAX_PACKET_SIZE 65536
 #define MAX_PORT 65536
@@ -23,7 +24,9 @@ typedef enum {
   CONN_RELAY,
 } connection_state;
 
-typedef struct {
+typedef struct connection_t connection_t;
+
+struct connection_t {
   connection_state state;
   u16 local_port;
   u8 fake_payload[CLIENT_HELLO_SIZE];
@@ -36,56 +39,56 @@ typedef struct {
   u16 client_isn;
   pm_writer client_writer;
   bool client_done;
-} connection_t;
+
+  connection_t *next;
+};
 
 const char *fake_sni = "hcaptcha.com";
-const char *connect_ip = "188.114.96.3";
+// const char *connect_ip = "104.18.138.67";
+// const char *connect_ip = "188.114.96.3";
+const char *connect_ip = "104.18.32.47";
 
 int interface_index;
 connection_t *connections[MAX_PORT];
+connection_t *free_connections = NULL;
 
 connection_t *new_connection(int client_fd, int upstream_fd, u16 local_port) {
-  connection_t *conn = malloc(sizeof(*conn));
+  connection_t *conn;
+
+  if (free_connections) {
+    conn = free_connections;
+    free_connections = conn->next;
+
+    pm_writer_reset(&conn->client_writer);
+    pm_writer_reset(&conn->upstream_writer);
+
+    conn->client_writer.fd = client_fd;
+    conn->upstream_writer.fd = upstream_fd;
+  } else {
+    conn = malloc(sizeof(*conn));
+    pm_writer_init(&conn->client_writer, client_fd, BUFFER_SIZE);
+    pm_writer_init(&conn->upstream_writer, upstream_fd, BUFFER_SIZE);
+  }
+
   conn->state = CONN_WAIT_FOR_SYN;
   conn->upstream_fd = upstream_fd;
   conn->client_fd = client_fd;
   conn->client_done = false;
   conn->upstream_done = false;
-
-  pm_writer_init(&conn->client_writer, client_fd, 4096);
-  pm_writer_init(&conn->upstream_writer, upstream_fd, 4096);
+  conn->next = NULL;
   return conn;
 }
 
 static void close_connection(connection_t *conn, pm_loop *loop) {
   LOG_INFO("fd=%d closing", conn->client_fd);
 
-  pm_writer_free(&conn->client_writer);
+  conn->next = free_connections;
+  free_connections = conn;
+
   pm_loop_del(loop, conn->client_fd);
-  close(conn->client_fd);
-
-  pm_writer_free(&conn->upstream_writer);
   pm_loop_del(loop, conn->upstream_fd);
+  close(conn->client_fd);
   close(conn->upstream_fd);
-
-  free(conn);
-}
-
-bool relay(int from_fd, pm_writer *to_writer) {
-  u8 buf[4096];
-  ssize_t nread = recv(from_fd, buf, sizeof(buf), 0);
-  if (nread < 0 && errno != EAGAIN) {
-    return false;
-  }
-
-  if (nread == 0) {
-    return false;
-  }
-
-  pm_write_result wr = pm_writer_write_bytes(to_writer, buf, (size_t)nread);
-  if (wr.status == PM_WRITE_ERR) return false;
-
-  return true;
 }
 
 void update_events(connection_t *conn, pm_loop *loop) {
@@ -116,7 +119,7 @@ void handle_upstream(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   }
 
   if (events & PM_EVENT_READABLE) {
-    u8 buf[4096];
+    u8 buf[BUFFER_SIZE];
     ssize_t nread = recv(conn->upstream_fd, buf, sizeof(buf), 0);
     if (nread < 0 && errno != EAGAIN) {
       close_connection(conn, loop);
@@ -158,7 +161,7 @@ void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   }
 
   if (events & PM_EVENT_READABLE) {
-    u8 buf[4096];
+    u8 buf[BUFFER_SIZE];
     ssize_t nread = recv(conn->client_fd, buf, sizeof(buf), 0);
     if (nread < 0 && errno != EAGAIN) {
       close_connection(conn, loop);
