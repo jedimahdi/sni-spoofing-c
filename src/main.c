@@ -93,7 +93,7 @@ connection_t *new_connection(int client_fd, int upstream_fd, u16 local_port) {
 }
 
 static void close_connection(connection_t *conn, pm_loop *loop) {
-  LOG_INFO("fd=%d closing", conn->client_fd);
+  LOG_INFO("[Client] fd=%d closing", conn->client_fd);
 
   conn->next = free_connections;
   free_connections = conn;
@@ -166,7 +166,6 @@ void handle_upstream(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
 
 void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   connection_t *conn = ud;
-  LOG_INFO("[Client] fd=%d READABLE", conn->client_fd);
 
   if (events & (PM_EVENT_HANGUP | PM_EVENT_ERROR)) {
     LOG_ERROR("[Client] hangup | err");
@@ -240,8 +239,8 @@ void on_accept(int server_fd, pm_loop *loop, pm_event_mask events, void *ud) {
 
   set_nonblocking(upstream_fd);
 
-  pm_loop_add(loop, client_fd, PM_EVENT_READABLE, handle_client, conn);
-  pm_loop_add(loop, upstream_fd, PM_EVENT_READABLE, handle_upstream, conn);
+  pm_loop_add(loop, client_fd, 0, handle_client, conn);
+  pm_loop_add(loop, upstream_fd, 0, handle_upstream, conn);
 }
 
 void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
@@ -300,6 +299,8 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
     }
     LOG_INFO("[PACKET] fd=%d, Fake ClientHello injected successfully (port %u)", conn->client_fd, src_port);
 
+    pm_loop_mod(loop, conn->client_fd, PM_EVENT_WRITABLE);
+    pm_loop_mod(loop, conn->upstream_fd, PM_EVENT_WRITABLE);
     conn->state = CONN_RELAY;
   }
 }
