@@ -23,6 +23,7 @@
 #include <net/if.h>
 #include <time.h>
 #include <assert.h>
+#include <ifaddrs.h>
 
 void _log(LogLevel level, const char *fmt, ...) {
   char *level_string[] = {
@@ -115,6 +116,72 @@ void set_nonblocking(int fd) {
   if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) die("fcntl:");
 }
 
+bool get_local_iface(const char *target_ip, char *local_ip, size_t local_ip_len, char *iface_name, size_t iface_len, int *iface_index) {
+  assert(local_ip_len >= INET_ADDRSTRLEN);
+  assert(iface_len >= IFNAMSIZ);
+
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    perror("socket");
+    return false;
+  }
+  struct sockaddr_in remote = {0};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(53);
+  inet_pton(AF_INET, target_ip, &remote.sin_addr);
+
+  if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+    perror("connect");
+    close(sock);
+    return false;
+  }
+
+  struct sockaddr_in local = {0};
+  socklen_t len = sizeof(local);
+
+  if (getsockname(sock, (struct sockaddr *)&local, &len) < 0) {
+    perror("getsockname");
+    close(sock);
+    return false;
+  }
+
+  inet_ntop(AF_INET, &local.sin_addr, local_ip, local_ip_len);
+  close(sock);
+
+  struct ifaddrs *ifa;
+  struct ifaddrs *p;
+  if (getifaddrs(&ifa) != 0) {
+    perror("getifaddrs");
+    return false;
+  }
+
+  for (p = ifa; p != NULL; p = p->ifa_next) {
+    if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
+      continue;
+
+    struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+    if (memcmp(&sin->sin_addr, &local.sin_addr, sizeof(struct in_addr)) == 0) {
+      strcpy(iface_name, p->ifa_name);
+      *iface_index = if_nametoindex(p->ifa_name);
+      freeifaddrs(ifa);
+      return true;
+    }
+  }
+
+  fprintf(stderr, "No interface found for local IP %s. Available IPv4 interfaces:\n", local_ip);
+  for (struct ifaddrs *p = ifa; p != NULL; p = p->ifa_next) {
+    if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+      char ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+      printf("  %s -> %s\n", p->ifa_name, ip);
+    }
+  }
+
+  freeifaddrs(ifa);
+  return false;
+}
+
 void apply_bpf_filter(int raw_fd) {
   struct sock_filter code[] = {
       // Load EtherType (bytes 12-13)
@@ -139,36 +206,25 @@ void apply_bpf_filter(int raw_fd) {
   }
 }
 
-int rawsocket(const char *interface_name, int *out_interface_index) {
+int rawsocket(int iface_index) {
   int raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (raw_sock < 0) {
-    perror("socket");
-    return 1;
+    perror("socket(AF_PACKET)");
+    return -1;
   }
 
   apply_bpf_filter(raw_sock);
 
-  const char *ifname = "eno1";
-
-  struct ifreq ifr;
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-  if (ioctl(raw_sock, SIOCGIFINDEX, &ifr) < 0) {
-    perror("ioctl SIOCGIFINDEX");
-    return 1;
-  }
-
-  struct sockaddr_ll sll;
-  memset(&sll, 0, sizeof(sll));
+  struct sockaddr_ll sll = {0};
   sll.sll_family = AF_PACKET;
-  sll.sll_ifindex = ifr.ifr_ifindex;
+  sll.sll_ifindex = iface_index;
   sll.sll_protocol = htons(ETH_P_ALL);
+
   if (bind(raw_sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
     perror("bind");
-    return 1;
+    close(raw_sock);
+    return -1;
   }
-
-  *out_interface_index = ifr.ifr_ifindex;
 
   return raw_sock;
 }

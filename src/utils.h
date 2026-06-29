@@ -31,7 +31,8 @@ typedef ptrdiff_t isize;
 int listen_tcp(const char *port);
 void die(const char *fmt, ...);
 void set_nonblocking(int fd);
-int rawsocket(const char *interface_name, int *out_interface_index);
+bool get_local_iface(const char *target_ip, char *local_ip, size_t local_ip_len, char *iface_name, size_t iface_len, int *iface_index);
+int rawsocket(int iface_index);
 
 #define CLIENT_HELLO_SIZE 517
 void build_client_hello(const char *sni, uint8_t *out_buffer);

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <net/if.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -13,7 +14,7 @@
 #include "pm/loop.h"
 #include "pm/writer.h"
 
-#define BUFFER_SIZE 8192
+#define BUFFER_SIZE 16384
 #define MAX_EVENTS 64
 #define MAX_PACKET_SIZE 65536
 #define MAX_PORT 65536
@@ -48,7 +49,7 @@ const char *fake_sni = "hcaptcha.com";
 // const char *connect_ip = "188.114.96.3";
 const char *connect_ip = "104.18.32.47";
 
-int interface_index;
+int iface_index;
 connection_t *connections[MAX_PORT];
 connection_t *free_connections = NULL;
 
@@ -288,7 +289,7 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
     build_fake_frame(buf, nread, conn->client_isn, conn->fake_payload, CLIENT_HELLO_SIZE, fake_frame, &fake_frame_len);
 
     struct sockaddr_ll sll = {0};
-    sll.sll_ifindex = interface_index;
+    sll.sll_ifindex = iface_index;
     sll.sll_halen = 6;
     memcpy(sll.sll_addr, eth->h_dest, 6);
 
@@ -305,10 +306,15 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
 int main() {
   signal(SIGPIPE, SIG_IGN);
 
-  const char *ifname = "eno1";
-  int raw_sock = rawsocket(ifname, &interface_index);
+  char local_ip[INET_ADDRSTRLEN];
+  char iface_name[IFNAMSIZ];
+  get_local_iface(connect_ip, local_ip, sizeof(local_ip), iface_name, sizeof(iface_name), &iface_index);
+
+  LOG_INFO("local_ip = %s, iface_name = %s, iface_index = %d", local_ip, iface_name, iface_index);
+
+  int raw_sock = rawsocket(iface_index);
   set_nonblocking(raw_sock);
-  LOG_INFO("Listening on interface %s...", ifname);
+  LOG_INFO("Listening on interface %s(%d)...", iface_name, iface_index);
 
   const char *port = "443";
   int server_sock = listen_tcp(port);
