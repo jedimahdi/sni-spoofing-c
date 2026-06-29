@@ -2,13 +2,15 @@
 #include <net/if.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/if_packet.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 #include "utils.h"
 #include "pm/loop.h"
@@ -44,12 +46,22 @@ struct connection_t {
   connection_t *next;
 };
 
-const char *fake_sni = "hcaptcha.com";
-// const char *connect_ip = "104.18.138.67";
-// const char *connect_ip = "188.114.96.3";
-const char *connect_ip = "104.18.32.47";
+typedef struct {
+  const char *connect_ip;
+  const char *connect_port;
+  const char *listen_host;
+  const char *listen_port;
+  const char *fake_sni;
 
-int iface_index;
+  char local_ip[INET_ADDRSTRLEN];
+  struct sockaddr_in connect_addr;
+
+  char iface_name[IFNAMSIZ];
+  int iface_index;
+} config_t;
+
+config_t cfg;
+
 connection_t *connections[MAX_PORT];
 connection_t *free_connections = NULL;
 
@@ -154,6 +166,7 @@ void handle_upstream(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
 
 void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   connection_t *conn = ud;
+  LOG_INFO("[Client] fd=%d READABLE", conn->client_fd);
 
   if (events & (PM_EVENT_HANGUP | PM_EVENT_ERROR)) {
     LOG_ERROR("[Client] hangup | err");
@@ -199,26 +212,15 @@ void on_accept(int server_fd, pm_loop *loop, pm_event_mask events, void *ud) {
     return;
   }
 
-  int upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
+  int upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (upstream_fd < 0) {
     LOG_ERROR("socket: %s", strerror(errno));
     close(client_fd);
     return;
   }
 
-  struct sockaddr_in upstream_addr;
-  memset(&upstream_addr, 0, sizeof(upstream_addr));
-  upstream_addr.sin_family = AF_INET;
-  upstream_addr.sin_port = htons(443);
-  if (inet_pton(AF_INET, connect_ip, &upstream_addr.sin_addr) <= 0) {
-    LOG_ERROR("inet_pton: %s", strerror(errno));
-    close(client_fd);
-    close(upstream_fd);
-    return;
-  }
-
-  if (connect(upstream_fd, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) < 0) {
-    LOG_ERROR("connect: %s", strerror(errno));
+  if (connect(upstream_fd, (struct sockaddr *)&cfg.connect_addr, sizeof(cfg.connect_addr)) < 0) {
+    LOG_ERROR("connect(upstream %d): %s", upstream_fd, strerror(errno));
     close(client_fd);
     close(upstream_fd);
     return;
@@ -234,9 +236,8 @@ void on_accept(int server_fd, pm_loop *loop, pm_event_mask events, void *ud) {
 
   LOG_INFO("[ACCEPT] fd=%d upstream_fd=%d local_port=%u", client_fd, upstream_fd, local_port);
 
-  build_client_hello("hcaptcha.com", conn->fake_payload);
+  build_client_hello(cfg.fake_sni, conn->fake_payload);
 
-  set_nonblocking(client_fd);
   set_nonblocking(upstream_fd);
 
   pm_loop_add(loop, client_fd, PM_EVENT_READABLE, handle_client, conn);
@@ -289,37 +290,74 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
     build_fake_frame(buf, nread, conn->client_isn, conn->fake_payload, CLIENT_HELLO_SIZE, fake_frame, &fake_frame_len);
 
     struct sockaddr_ll sll = {0};
-    sll.sll_ifindex = iface_index;
+    sll.sll_ifindex = cfg.iface_index;
     sll.sll_halen = 6;
     memcpy(sll.sll_addr, eth->h_dest, 6);
 
     // usleep(100);
     if (sendto(raw_sock, fake_frame, fake_frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) <= 0) {
-      LOG_ERROR("Fake ClientHello injection failed: %s", strerror(errno));
+      LOG_ERROR("[PACKET] fd=%d, Fake ClientHello injection failed: %s", conn->client_fd, strerror(errno));
     }
-    LOG_INFO("Fake ClientHello injected successfully (port %u)", src_port);
+    LOG_INFO("[PACKET] fd=%d, Fake ClientHello injected successfully (port %u)", conn->client_fd, src_port);
 
     conn->state = CONN_RELAY;
   }
 }
 
-int main() {
+void init_config(int argc, char *argv[]) {
+  memset(&cfg, 0, sizeof(cfg));
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--connect-ip") == 0) {
+      cfg.connect_ip = argv[++i];
+    } else if (strcmp(argv[i], "--connect-port") == 0) {
+      cfg.connect_port = argv[++i];
+    } else if (strcmp(argv[i], "--listen-host") == 0) {
+      cfg.listen_host = argv[++i];
+    } else if (strcmp(argv[i], "--listen-port") == 0) {
+      cfg.listen_port = argv[++i];
+    } else if (strcmp(argv[i], "--fake-sni") == 0) {
+      cfg.fake_sni = argv[++i];
+    }
+  }
+
+  if (cfg.connect_ip == NULL) cfg.connect_ip = "104.18.32.47";
+  if (cfg.connect_port == NULL) cfg.connect_port = "443";
+  if (cfg.fake_sni == NULL) cfg.fake_sni = "hcaptcha.com";
+  if (cfg.listen_host == NULL) cfg.listen_host = "127.0.0.1";
+  if (cfg.listen_port == NULL) cfg.listen_port = "443";
+
+  get_local_iface(cfg.connect_ip, cfg.local_ip, sizeof(cfg.local_ip), cfg.iface_name, sizeof(cfg.iface_name), &cfg.iface_index);
+
+  struct addrinfo hints = {0};
+  struct addrinfo *res;
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  int ret = getaddrinfo(cfg.connect_ip, cfg.connect_port, &hints, &res);
+  if (ret != 0) {
+    LOG_ERROR("getaddrinfo(%s:%s): %s", cfg.connect_ip, cfg.connect_port, gai_strerror(ret));
+    exit(1);
+  }
+  memcpy(&cfg.connect_addr, res->ai_addr, res->ai_addrlen);
+
+  freeaddrinfo(res);
+}
+
+int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
 
-  char local_ip[INET_ADDRSTRLEN];
-  char iface_name[IFNAMSIZ];
-  get_local_iface(connect_ip, local_ip, sizeof(local_ip), iface_name, sizeof(iface_name), &iface_index);
+  init_config(argc, argv);
 
-  LOG_INFO("local_ip = %s, iface_name = %s, iface_index = %d", local_ip, iface_name, iface_index);
+  LOG_INFO("CONFIG: fake-sni=%s, connect-ip=%s, connect-port=%s, listen-host=%s, listen-port=%s", cfg.fake_sni, cfg.connect_ip, cfg.connect_port, cfg.listen_host, cfg.listen_port);
 
-  int raw_sock = rawsocket(iface_index);
+  int raw_sock = rawsocket(cfg.iface_index);
   set_nonblocking(raw_sock);
-  LOG_INFO("Listening on interface %s(%d)...", iface_name, iface_index);
+  LOG_INFO("Listening on interface %s(%d)...", cfg.iface_name, cfg.iface_index);
 
-  const char *port = "443";
-  int server_sock = listen_tcp(port);
+  int server_sock = listen_tcp(cfg.listen_host, cfg.listen_port);
   set_nonblocking(server_sock);
-  LOG_INFO("Proxy listening on 127.0.0.1:%s", port);
+  LOG_INFO("Proxy listening on %s:%s", cfg.listen_host, cfg.listen_port);
 
   pm_loop loop;
   pm_loop_init(&loop);

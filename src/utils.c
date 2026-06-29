@@ -41,22 +41,16 @@ void _log(LogLevel level, const char *fmt, ...) {
   fprintf(stderr, "\n");
 }
 
-int listen_tcp(const char *port) {
-  struct addrinfo hints;
-  struct addrinfo *result, *rp;
+int listen_tcp(const char *hostname, const char *port) {
   int sfd = -1;
   int yes = 1;
 
-  memset(&hints, 0, sizeof(hints));
+  struct addrinfo *result, *rp;
+  struct addrinfo hints = {0};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-  hints.ai_protocol = 0;
-  hints.ai_canonname = NULL;
-  hints.ai_addr = NULL;
-  hints.ai_next = NULL;
 
-  int s = getaddrinfo(NULL, port, &hints, &result);
+  int s = getaddrinfo(hostname, port, &hints, &result);
   if (s != 0) {
     fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
     exit(1);
@@ -80,11 +74,11 @@ int listen_tcp(const char *port) {
   freeaddrinfo(result);
 
   if (rp == NULL || sfd == -1) {
-    fprintf(stderr, "Could not bind\n");
+    fprintf(stderr, "Could not bind to %s:%s\n", hostname, port);
     exit(1);
   }
 
-  if (listen(sfd, 69) != 0) {
+  if (listen(sfd, SOMAXCONN) != 0) {
     perror("listen");
     close(sfd);
     exit(1);

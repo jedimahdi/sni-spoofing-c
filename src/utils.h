@@ -28,7 +28,7 @@ typedef uint64_t u64;
 
 typedef ptrdiff_t isize;
 
-int listen_tcp(const char *port);
+int listen_tcp(const char *hostname, const char *port);
 void die(const char *fmt, ...);
 void set_nonblocking(int fd);
 bool get_local_iface(const char *target_ip, char *local_ip, size_t local_ip_len, char *iface_name, size_t iface_len, int *iface_index);
