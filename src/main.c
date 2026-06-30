@@ -19,7 +19,7 @@
 #define BUFFER_SIZE 16384
 #define MAX_EVENTS 64
 #define MAX_PACKET_SIZE 65536
-#define MAX_PORT 65536
+#define MAX_PORT UINT16_MAX
 
 typedef enum {
   CONN_WAIT_FOR_SYN,
@@ -120,13 +120,13 @@ void handle_upstream(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   connection_t *conn = ud;
 
   if (events & PM_EVENT_HANGUP) {
-    LOG_ERROR("[Upstream] hangup");
+    LOG_WARN("[Upstream] hangup");
     close_connection(conn, loop);
     return;
   }
 
   if (events & PM_EVENT_ERROR) {
-    LOG_ERROR("[Upstream]  err");
+    LOG_WARN("[Upstream]  err");
     close_connection(conn, loop);
     return;
   }
@@ -168,7 +168,7 @@ void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   connection_t *conn = ud;
 
   if (events & (PM_EVENT_HANGUP | PM_EVENT_ERROR)) {
-    LOG_ERROR("[Client] hangup | err");
+    LOG_WARN("[Client] hangup | err");
     close_connection(conn, loop);
     return;
   }
@@ -193,7 +193,7 @@ void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
   if (events & PM_EVENT_WRITABLE) {
     pm_write_status st = pm_writer_flush(&conn->client_writer);
     if (st == PM_WRITE_ERR) {
-      LOG_ERROR("[Client] write error");
+      LOG_WARN("[Client] fd=%d, write error", conn->client_fd);
       close_connection(conn, loop);
       return;
     }
@@ -219,7 +219,7 @@ void on_accept(int server_fd, pm_loop *loop, pm_event_mask events, void *ud) {
   }
 
   if (connect(upstream_fd, (struct sockaddr *)&cfg.connect_addr, sizeof(cfg.connect_addr)) < 0) {
-    LOG_ERROR("connect(upstream %d): %s", upstream_fd, strerror(errno));
+    LOG_WARN("connect(upstream %d): %s", upstream_fd, strerror(errno));
     close(client_fd);
     close(upstream_fd);
     return;
@@ -295,7 +295,9 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
 
     // usleep(100);
     if (sendto(raw_sock, fake_frame, fake_frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) <= 0) {
-      LOG_ERROR("[PACKET] fd=%d, Fake ClientHello injection failed: %s", conn->client_fd, strerror(errno));
+      LOG_WARN("[PACKET] fd=%d, Fake ClientHello injection failed: %s", conn->client_fd, strerror(errno));
+      close_connection(conn, loop);
+      return;
     }
     LOG_INFO("[PACKET] fd=%d, Fake ClientHello injected successfully (port %u)", conn->client_fd, src_port);
 
@@ -305,11 +307,25 @@ void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
   }
 }
 
+void usage() {
+  fprintf(stderr, "usage: sni-spoofing-c [options]\n\n");
+  fprintf(stderr, "OPTIONS\n");
+  fprintf(stderr, "  -h, --help    \n");
+  fprintf(stderr, "  --fake-sni    \thcaptcha.com\n");
+  fprintf(stderr, "  --connect-ip  \t104.19.229.21\n");
+  fprintf(stderr, "  --connect-port\t443\n");
+  fprintf(stderr, "  --listen-host \t127.0.0.1\n");
+  fprintf(stderr, "  --listen-port \t40443\n");
+}
+
 void init_config(int argc, char *argv[]) {
   memset(&cfg, 0, sizeof(cfg));
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--connect-ip") == 0) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      usage();
+      exit(0);
+    } else if (strcmp(argv[i], "--connect-ip") == 0) {
       cfg.connect_ip = argv[++i];
     } else if (strcmp(argv[i], "--connect-port") == 0) {
       cfg.connect_port = argv[++i];
