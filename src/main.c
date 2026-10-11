@@ -15,13 +15,18 @@
 #include "utils.h"
 #include "pm/loop.h"
 #include "pm/writer.h"
+#include "timer.h"
 
 #define BUFFER_SIZE 16384
 #define MAX_EVENTS 64
 #define MAX_PACKET_SIZE 65536
 #define MAX_PORT UINT16_MAX
 
+#define CONNECT_TIMEOUT_MS 5000 // 5 seconds
+#define IDLE_TIMEOUT_MS 60000 // 60 seconds
+
 typedef enum {
+  CONN_CONNECTING,
   CONN_WAIT_FOR_SYN,
   CONN_WAIT_FOR_ACK,
   CONN_RELAY,
@@ -42,6 +47,8 @@ struct connection_t {
   u16 client_isn;
   pm_writer client_writer;
   bool client_done;
+
+  u64 last_event_ms;
 
   connection_t *next;
 };
@@ -65,7 +72,7 @@ config_t cfg;
 connection_t *connections[MAX_PORT];
 connection_t *free_connections = NULL;
 
-connection_t *new_connection(int client_fd, int upstream_fd, u16 local_port) {
+connection_t *new_connection(int client_fd, int upstream_fd) {
   connection_t *conn;
 
   if (free_connections) {
@@ -83,7 +90,7 @@ connection_t *new_connection(int client_fd, int upstream_fd, u16 local_port) {
     pm_writer_init(&conn->upstream_writer, upstream_fd, BUFFER_SIZE);
   }
 
-  conn->state = CONN_WAIT_FOR_SYN;
+  conn->state = CONN_CONNECTING;
   conn->upstream_fd = upstream_fd;
   conn->client_fd = client_fd;
   conn->client_done = false;
@@ -205,42 +212,62 @@ void handle_client(int _fd, pm_loop *loop, pm_event_mask events, void *ud) {
 void on_accept(int server_fd, pm_loop *loop, pm_event_mask events, void *ud) {
   (void)ud;
   (void)events;
-  int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
-  if (client_fd < 0) {
-    LOG_ERROR("accept4: %s", strerror(errno));
-    return;
+
+  printf("before loop\n");
+  while (true) {
+  printf("before accept\n");
+    int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+  printf("after accept\n");
+    if (client_fd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      }
+      if (errno == EINTR) continue;
+      if (errno == EMFILE || errno == ENFILE) {
+        LOG_ERROR("accept4: too many open files");
+        break;
+      }
+
+      LOG_ERROR("accept4: %s", strerror(errno));
+      break;
+    }
+
+    int upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (upstream_fd < 0) {
+      LOG_ERROR("socket: %s", strerror(errno));
+      close(client_fd);
+      return;
+    }
+
+    connection_t *conn = new_connection(client_fd, upstream_fd);
+
+    int ret = connect(upstream_fd, (struct sockaddr *)&cfg.connect_addr, sizeof(cfg.connect_addr));
+    if (ret < 0) {
+      if (errno == EINPROGRESS) {
+        conn->state = CONN_CONNECTING;
+        continue;
+      } else {
+        LOG_WARN("connect(upstream %d): %s", upstream_fd, strerror(errno));
+        close(client_fd);
+        close(upstream_fd);
+        break;
+      }
+    }
+
+    conn->state = CONN_RELAY;
+
+    // struct sockaddr_in local;
+    // socklen_t len = sizeof(local);
+    // getsockname(upstream_fd, (struct sockaddr *)&local, &len);
+    // u16 local_port = ntohs(local.sin_port);
+    // connections[local_port] = conn;
+    // build_client_hello(cfg.fake_sni, conn->fake_payload);
+
+    LOG_INFO("[ACCEPT] fd=%d upstream_fd=%d", client_fd, upstream_fd);
+
+    pm_loop_add(loop, client_fd, 0, handle_client, conn);
+    pm_loop_add(loop, upstream_fd, 0, handle_upstream, conn);
   }
-
-  int upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (upstream_fd < 0) {
-    LOG_ERROR("socket: %s", strerror(errno));
-    close(client_fd);
-    return;
-  }
-
-  if (connect(upstream_fd, (struct sockaddr *)&cfg.connect_addr, sizeof(cfg.connect_addr)) < 0) {
-    LOG_WARN("connect(upstream %d): %s", upstream_fd, strerror(errno));
-    close(client_fd);
-    close(upstream_fd);
-    return;
-  }
-
-  struct sockaddr_in local;
-  socklen_t len = sizeof(local);
-  getsockname(upstream_fd, (struct sockaddr *)&local, &len);
-  u16 local_port = ntohs(local.sin_port);
-
-  connection_t *conn = new_connection(client_fd, upstream_fd, local_port);
-  connections[local_port] = conn;
-
-  LOG_INFO("[ACCEPT] fd=%d upstream_fd=%d local_port=%u", client_fd, upstream_fd, local_port);
-
-  build_client_hello(cfg.fake_sni, conn->fake_payload);
-
-  set_nonblocking(upstream_fd);
-
-  pm_loop_add(loop, client_fd, 0, handle_client, conn);
-  pm_loop_add(loop, upstream_fd, 0, handle_upstream, conn);
 }
 
 void on_packet(int raw_sock, pm_loop *loop, pm_event_mask events, void *ud) {
@@ -342,7 +369,7 @@ void init_config(int argc, char *argv[]) {
   if (cfg.connect_port == NULL) cfg.connect_port = "443";
   if (cfg.fake_sni == NULL) cfg.fake_sni = "hcaptcha.com";
   if (cfg.listen_host == NULL) cfg.listen_host = "127.0.0.1";
-  if (cfg.listen_port == NULL) cfg.listen_port = "443";
+  if (cfg.listen_port == NULL) cfg.listen_port = "40443";
 
   get_local_iface(cfg.connect_ip, cfg.local_ip, sizeof(cfg.local_ip), cfg.iface_name, sizeof(cfg.iface_name), &cfg.iface_index);
 
@@ -361,16 +388,56 @@ void init_config(int argc, char *argv[]) {
   freeaddrinfo(res);
 }
 
+void loop_run_timed(pm_loop *l, timer_heap *timers) {
+  l->running = true;
+
+  while (l->running) {
+    uint64_t now = get_time_ms();
+    int timeout_ms = -1;
+
+    timer_node *next_timer = timer_heap_peak(timers);
+    if (next_timer != NULL) {
+      if (next_timer->expire_at_ms <= now) {
+        timeout_ms = 0;
+      } else {
+        timeout_ms = (int)(next_timer->expire_at_ms - now);
+      }
+    }
+
+    pm_loop_once(l, timeout_ms);
+
+    now = get_time_ms();
+    while (true) {
+      timer_node *t = timer_heap_peak(timers);
+      if (t == NULL || t->expire_at_ms > now) break;
+
+      timer_node expired = timer_heap_pop(timers);
+      connection_t *conn = (connection_t *)expired.user_data;
+
+      uint64_t time_since_last_event = now - conn->last_event_ms;
+
+      if (time_since_last_event >= IDLE_TIMEOUT_MS) {
+        LOG_INFO("Connection %d timed out", conn->client_fd);
+        close_connection(conn, l);
+      } else {
+        uint64_t new_expire = conn->last_event_ms + IDLE_TIMEOUT_MS;
+        timer_heap_push(timers, new_expire, conn);
+      }
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
 
   init_config(argc, argv);
 
-  LOG_INFO("CONFIG: fake-sni=%s, connect-ip=%s, connect-port=%s, listen-host=%s, listen-port=%s", cfg.fake_sni, cfg.connect_ip, cfg.connect_port, cfg.listen_host, cfg.listen_port);
+  LOG_INFO("CONFIG: fake-sni=%s, connect-ip=%s, connect-port=%s, listen-host=%s, listen-port=%s",
+           cfg.fake_sni, cfg.connect_ip, cfg.connect_port, cfg.listen_host, cfg.listen_port);
 
-  int raw_sock = rawsocket(cfg.iface_index);
-  set_nonblocking(raw_sock);
-  LOG_INFO("Listening on interface %s(%d)...", cfg.iface_name, cfg.iface_index);
+  // int raw_sock = rawsocket(cfg.iface_index);
+  // set_nonblocking(raw_sock);
+  // LOG_INFO("Listening on interface %s(%d)...", cfg.iface_name, cfg.iface_index);
 
   int server_sock = listen_tcp(cfg.listen_host, cfg.listen_port);
   set_nonblocking(server_sock);
@@ -378,9 +445,13 @@ int main(int argc, char *argv[]) {
 
   pm_loop loop;
   pm_loop_init(&loop);
-  pm_loop_add(&loop, raw_sock, PM_EVENT_READABLE, on_packet, NULL);
+  // pm_loop_add(&loop, raw_sock, PM_EVENT_READABLE, on_packet, NULL);
   pm_loop_add(&loop, server_sock, PM_EVENT_READABLE, on_accept, NULL);
-  pm_loop_run(&loop, -1);
+
+  timer_heap timers;
+  timer_heap_init(&timers, 128);
+
+  loop_run_timed(&loop, &timers);
 
   return 0;
 }
